@@ -1,0 +1,1942 @@
+--[[
+	CarController - LocalScript (Luau)
+	Положить: StarterPlayer > StarterPlayerScripts > LocalScript
+
+	Машина строится на клиенте (видна только тебе).
+
+	ПК:
+	  E - сесть / F - выйти
+	  W / S - газ / тормоз (на месте S - задняя), A / D - руль
+	  Space - ручник
+	  L - фары, R - на колёса, T - подогнать машину, G - TCS
+	  C - вид от 1-го лица / снаружи
+	  Правая кнопка мыши (зажать) - крутить камеру, колесо - приблизить
+	Телефон:
+	  стик - ехать, палец по экрану справа - крутить камеру (щипок - приблизить),
+	  кнопки сверху: ВЫЙТИ, ФАРЫ, РУЧНИК, НА КОЛЁСА, 1 ЛИЦО
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+
+---------------------------------------------------------------------------
+-- НАСТРОЙКИ
+---------------------------------------------------------------------------
+local CFG = {
+	KEY_ENTER = Enum.KeyCode.E,
+	KEY_EXIT = Enum.KeyCode.F,
+	KEY_LIGHTS = Enum.KeyCode.L,
+	KEY_FLIP = Enum.KeyCode.R,
+	KEY_CALL = Enum.KeyCode.T,
+	KEY_CAMERA = Enum.KeyCode.C,
+	KEY_TCS = Enum.KeyCode.G,
+	ENTER_DISTANCE = 16,
+	SPAWN_DISTANCE = 22,
+	CALL_DISTANCE = 22,
+	SPAWN_LIFT = 2.5,
+
+	BODY_COLOR = Color3.fromRGB(184, 30, 36),
+	PLATE_TEXT = "A777MP",
+	PLATE_REGION = "77",
+
+	-- масса и шасси
+	MASS = 900,
+	WHEEL_RADIUS = 1.35,
+	WHEEL_WIDTH = 1.3,
+	AXLE_FRONT = -5.8,
+	AXLE_REAR = 5.6,
+	TRACK_HALF = 3.5,
+	MOUNT_Y = 0.3,
+
+	-- подвеска
+	SUSP_REST = 1.35,
+	SUSP_BUMP = 0.65,
+	SUSP_DROOP = 0.4,
+	SUSP_STATIC_COMPRESSION = 0.35,
+	SUSP_DAMPING_RATIO = 0.5,
+
+	-- шины
+	TIRE_GRIP = 1.15,
+	REAR_GRIP_BIAS = 1.0,
+	LATERAL_GAIN = 0.8,
+	ROLLING_RESISTANCE = 0.015,
+	SLIP_GAIN = 0.25,
+
+	-- двигатель и трансмиссия
+	DRIVE_WHEELS = "RWD", -- "RWD", "FWD" или "AWD"
+	ACCEL_FIRST_GEAR = 68,
+	IDLE_RPM = 900,
+	LAUNCH_RPM = 3500,
+	REDLINE_RPM = 7000,
+	GEARS = { 3.4, 2.1, 1.45, 1.05, 0.82, 0.68 },
+	REVERSE_RATIO = 3.2,
+	REVERSE_MAX_SPEED = 40,
+	FINAL_DRIVE = 4.3,
+	DRIVETRAIN_EFF = 0.9,
+	ENGINE_BRAKE = 0.5,
+	CLUTCH_MIN = 0.5,
+	CLUTCH_FULL_RPM = 2200,
+	SHIFT_TIME = 0.22,
+	UPSHIFT_RPM = { 3200, 6400 },
+	DOWNSHIFT_RPM = { 1500, 3300 },
+
+	-- тормоза
+	BRAKE_FORCE = 1.3,
+	BRAKE_FRONT_BIAS = 0.65,
+	HANDBRAKE_FORCE = 0.9,
+	ABS = true,
+
+	-- противобуксовочная система
+	TCS = true,
+	TCS_THRESHOLD = 0.15,
+	TCS_GAIN = 3.0,
+
+	-- аэродинамика
+	DRAG = 2.8e-4,
+	DOWNFORCE = 0.0012,
+
+	-- руль
+	STEER_MAX_LOW = 32,
+	STEER_MAX_HIGH = 6,
+	STEER_FADE_SPEED = 170,
+	STEER_RATE_IN = 2.6,
+	STEER_RATE_OUT = 3.6,
+
+	-- посадка / выход
+	SEAT_X = -1.9,
+	SEAT_Z = 0.2,
+	SEAT_TOP_Y = 0.0,
+	SIT_HEIGHT_R15 = 1.0,
+	SIT_HEIGHT_R6 = 1.5,
+	EXIT_VELOCITY_KEEP = 1.0,
+	EXIT_NOCOLLIDE_TIME = 1.5,
+
+	-- камера
+	EYE_HEIGHT = 3.0, -- глаза водителя над поверхностью сиденья
+	CAM_TOUCH_SENS = 0.006, -- радиан на пиксель (палец)
+	CAM_MOUSE_SENS = 0.004, -- радиан на пиксель (мышь)
+	CAM_RECENTER_DELAY = 2.0, -- через сколько секунд камера сама возвращается за машину
+	CAM_ZOOM_MIN = 0.55,
+	CAM_ZOOM_MAX = 2.0,
+}
+
+---------------------------------------------------------------------------
+-- УТИЛИТЫ
+---------------------------------------------------------------------------
+local function new(class, props, parent)
+	local inst = Instance.new(class)
+	for k, v in pairs(props) do
+		inst[k] = v
+	end
+	if parent then
+		inst.Parent = parent
+	end
+	return inst
+end
+
+local function approach(cur, target, up, down)
+	if target > cur then
+		return math.min(cur + up, target)
+	end
+	return math.max(cur - down, target)
+end
+
+local function wrapAngle(a)
+	return (a + math.pi) % (math.pi * 2) - math.pi
+end
+
+local TORQUE_CURVE = {
+	{ 1000, 0.60 }, { 2000, 0.82 }, { 3000, 0.95 }, { 4000, 1.00 },
+	{ 5000, 0.99 }, { 6000, 0.92 }, { 7000, 0.78 }, { 7600, 0.60 },
+}
+
+local function torqueFactor(rpm)
+	local c = TORQUE_CURVE
+	if rpm <= c[1][1] then
+		return c[1][2]
+	end
+	for i = 2, #c do
+		if rpm <= c[i][1] then
+			local a, b = c[i - 1], c[i]
+			return a[2] + (b[2] - a[2]) * (rpm - a[1]) / (b[1] - a[1])
+		end
+	end
+	return c[#c][2]
+end
+
+-- сцепление по материалу поверхности
+local SURFACE_GRIP = {}
+do
+	local byName = {
+		Asphalt = 1.0, Pavement = 1.0, Concrete = 0.97, Brick = 0.9, Cobblestone = 0.85,
+		Plastic = 0.95, SmoothPlastic = 0.9, Metal = 0.8, DiamondPlate = 0.85, Wood = 0.85,
+		WoodPlanks = 0.85, Slate = 0.9, Granite = 0.9, Marble = 0.8, Rock = 0.85, Basalt = 0.85,
+		Limestone = 0.9, Sandstone = 0.8, Pebble = 0.7, Ground = 0.75, Grass = 0.7,
+		LeafyGrass = 0.7, Sand = 0.6, Mud = 0.5, Salt = 0.6, Snow = 0.4, Glacier = 0.2,
+		Ice = 0.15, Fabric = 0.8, CorrodedMetal = 0.8, Foil = 0.7, Glass = 0.5,
+	}
+	for name, value in pairs(byName) do
+		local ok, item = pcall(function()
+			return Enum.Material[name]
+		end)
+		if ok and item then
+			SURFACE_GRIP[item] = value
+		end
+	end
+end
+
+local function isDriven(front)
+	local mode = CFG.DRIVE_WHEELS
+	if mode == "AWD" then
+		return true
+	elseif mode == "FWD" then
+		return front
+	end
+	return not front
+end
+
+---------------------------------------------------------------------------
+-- СОСТОЯНИЕ
+---------------------------------------------------------------------------
+local CAR = nil
+local HUD = nil
+local controls = nil
+local camDir = Vector3.new(0, 0, -1)
+local dragTouch = nil -- касание, которым крутим камеру
+local dragMouse = false -- зажата правая кнопка мыши
+
+local S = {
+	driving = false,
+	character = nil,
+	humanoid = nil,
+	root = nil,
+	seatWeld = nil,
+	sitTrack = nil,
+	diedConn = nil,
+	savedAutoRotate = true,
+
+	throttle = 0,
+	brake = 0,
+	steer = 0,
+	gear = 1,
+	reverse = false,
+	shiftTimer = 0,
+	shiftCooldown = 0,
+	reverseTimer = 0,
+	rpm = CFG.IDLE_RPM,
+
+	tcsEnabled = CFG.TCS,
+	tcsFactor = 1,
+	tcsActive = false,
+	absTimer = 0,
+	absActive = false,
+
+	lights = 0,
+	lastLights = -1,
+	lastBraking = false,
+	lastRev = false,
+	handbrakeOn = false,
+	touchHand = false,
+
+	camMode = 1, -- 1 = снаружи, 2 = от первого лица
+	lookYaw = 0,
+	lookPitch = 0,
+	lookTime = 0,
+	zoom = 1,
+	eyeLocal = Vector3.new(0, 3, 0),
+
+	arms = nil,
+	armErr = false,
+
+	speedKmh = 0,
+	lastKmh = -1,
+}
+
+local NO_INPUT = { fwd = 0, back = 0, steer = 0, hand = false }
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+pcall(function()
+	rayParams.RespectCanCollide = true
+end)
+
+local camRayParams = RaycastParams.new()
+camRayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local enterCar, exitCar, flipCar, callCar, cycleLights, toggleCamera
+
+---------------------------------------------------------------------------
+-- ВСПОМОГАТЕЛЬНЫЕ ДЕТАЛИ (свет, дым, номерные знаки)
+---------------------------------------------------------------------------
+local function addSpot(part, range, angle, brightness)
+	return new("SpotLight", {
+		Face = Enum.NormalId.Front,
+		Range = range,
+		Angle = angle,
+		Brightness = brightness,
+		Color = Color3.fromRGB(255, 244, 220),
+		Shadows = false,
+		Enabled = false,
+	}, part)
+end
+
+local function addSmoke(part, direction, big)
+	local e = Instance.new("ParticleEmitter")
+	e.Texture = "rbxasset://textures/particles/smoke_main.dds"
+	e.Color = ColorSequence.new(Color3.fromRGB(200, 200, 205))
+	e.Transparency = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, big and 0.5 or 0.6),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+	e.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, big and 1.5 or 0.3),
+		NumberSequenceKeypoint.new(1, big and 5 or 1.6),
+	})
+	e.Lifetime = NumberRange.new(0.5, big and 1.1 or 0.9)
+	e.Speed = NumberRange.new(2, big and 7 or 6)
+	e.SpreadAngle = Vector2.new(big and 25 or 8, big and 25 or 8)
+	e.Rate = 0
+	e.EmissionDirection = direction
+	e.Drag = 1.5
+	e.Acceleration = Vector3.new(0, 1.5, 0)
+	e.Rotation = NumberRange.new(0, 360)
+	e.Parent = part
+	return e
+end
+
+local function addPlate(part, face)
+	local gui = Instance.new("SurfaceGui")
+	gui.Face = face
+	gui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+	gui.CanvasSize = Vector2.new(343, 100)
+	gui.LightInfluence = 0.4
+	gui.AlwaysOnTop = false
+	gui.Parent = part
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Size = UDim2.fromScale(1, 1),
+		Text = CFG.PLATE_TEXT .. "  " .. CFG.PLATE_REGION,
+		Font = Enum.Font.GothamBold,
+		TextScaled = true,
+		TextColor3 = Color3.fromRGB(20, 20, 24),
+	}, gui)
+end
+
+local function setEmissive(part, on, colorOn, colorOff)
+	if on then
+		part.Material = Enum.Material.Neon
+		part.Color = colorOn
+	else
+		part.Material = Enum.Material.SmoothPlastic
+		part.Color = colorOff
+	end
+end
+
+---------------------------------------------------------------------------
+-- ПОСТРОЕНИЕ МАШИНЫ
+-- Система координат шасси: +X вправо, +Y вверх, -Z вперёд.
+---------------------------------------------------------------------------
+local HEAD_ON = Color3.fromRGB(255, 250, 225)
+local HEAD_OFF = Color3.fromRGB(200, 205, 210)
+local TAIL_OFF = Color3.fromRGB(95, 10, 12)
+local REV_OFF = Color3.fromRGB(190, 190, 190)
+
+local function buildCar(spawnCF)
+	local model = Instance.new("Model")
+	model.Name = "LocalCar"
+
+	-- Шасси: невидимый коллайдер, единственная деталь с массой.
+	local volume = 8.0 * 2.8 * 17.6
+	local chassis = Instance.new("Part")
+	chassis.Name = "Chassis"
+	chassis.Size = Vector3.new(8.0, 2.8, 17.6)
+	chassis.Transparency = 1
+	chassis.CanCollide = true
+	chassis.Anchored = false
+	chassis.CastShadow = false
+	chassis.TopSurface = Enum.SurfaceType.Smooth
+	chassis.BottomSurface = Enum.SurfaceType.Smooth
+	chassis.CustomPhysicalProperties = PhysicalProperties.new(CFG.MASS / volume, 0.2, 0, 1, 1)
+	pcall(function()
+		chassis.RootPriority = 127
+	end)
+	chassis.CFrame = spawnCF
+	chassis.Parent = model
+	model.PrimaryPart = chassis
+
+	local car = {
+		model = model,
+		chassis = chassis,
+		wheels = {},
+		headLenses = {},
+		driveLenses = {},
+		headSpots = {},
+		highSpots = {},
+		tailLenses = {},
+		tailLights = {},
+		reverseLenses = {},
+		exhaustSmoke = {},
+	}
+
+	local function weld(part, localCF, base)
+		local w = Instance.new("Weld")
+		w.Part0 = base or chassis
+		w.Part1 = part
+		w.C0 = localCF
+		w.Parent = part
+		return w
+	end
+
+	-- Универсальная деталь: все детали кузова massless и сварены Weld'ом.
+	local function mk(name, size, localCF, color, material, opts, base)
+		opts = opts or {}
+		local p = Instance.new("Part")
+		p.Name = name
+		if opts.cylinder then
+			p.Shape = Enum.PartType.Cylinder
+		end
+		p.Size = size
+		p.Color = color
+		p.Material = material or Enum.Material.SmoothPlastic
+		p.Anchored = false
+		p.CanCollide = false
+		p.CanTouch = false
+		p.CanQuery = false
+		p.Massless = true
+		p.CastShadow = opts.shadow ~= false
+		p.TopSurface = Enum.SurfaceType.Smooth
+		p.BottomSurface = Enum.SurfaceType.Smooth
+		p.Transparency = opts.transparency or 0
+		p.Reflectance = opts.reflectance or 0
+		p.CFrame = (base or chassis).CFrame * localCF
+		p.Parent = model
+		weld(p, localCF, base)
+		return p
+	end
+
+	-- Параллелепипед по центру (x, y, z), поворот rx в градусах вокруг X.
+	local function box(name, x, y, z, sx, sy, sz, color, material, opts, rx)
+		local cf = CFrame.new(x, y, z)
+		if rx then
+			cf = cf * CFrame.Angles(math.rad(rx), 0, 0)
+		end
+		return mk(name, Vector3.new(sx, sy, sz), cf, color, material, opts)
+	end
+
+	local BODY = CFG.BODY_COLOR
+	local TRIM = Color3.fromRGB(24, 24, 28)
+	local DARK = Color3.fromRGB(10, 10, 12)
+	local GLASS = Color3.fromRGB(120, 160, 185)
+	local CHROME = Color3.fromRGB(205, 210, 216)
+	local INTERIOR = Color3.fromRGB(48, 48, 54)
+	local SEATCOL = Color3.fromRGB(32, 32, 36)
+	local TIRE = Color3.fromRGB(20, 20, 22)
+	local PLATE = Color3.fromRGB(240, 240, 236)
+	local GLASSOPT = { transparency = 0.45, reflectance = 0.1, shadow = false }
+	local PAINT = { reflectance = 0.06 }
+	local INVIS = { transparency = 1, shadow = false }
+
+	local aF, aR = CFG.AXLE_FRONT, CFG.AXLE_REAR
+	local ARCH_R = 1.8
+	local restL = CFG.SUSP_REST - CFG.SUSP_STATIC_COMPRESSION
+	local wheelCY = CFG.MOUNT_Y - restL -- высота центра колеса в покое
+
+	-- Пол и обвес
+	box("Floor", 0, -1.25, 0.2, 7.6, 0.3, 18.2, TRIM)
+	box("Splitter", 0, -1.38, -9.8, 8.0, 0.12, 0.9, TRIM)
+	box("Diffuser", 0, -1.3, 9.7, 5.0, 0.15, 0.5, DARK)
+
+	-- Нос: наклонная панель, решётка, бампер
+	local noseCF = CFrame.new(0, 0.5, -8.85) * CFrame.Angles(math.rad(33), 0, 0)
+	mk("Nose", Vector3.new(7.8, 1.6, 0.3), noseCF, BODY, nil, PAINT)
+	mk("Grille", Vector3.new(3.4, 0.8, 0.12), noseCF * CFrame.new(0, 0, -0.2), DARK)
+	for i = -1, 1 do
+		mk("GrilleBar", Vector3.new(3.4, 0.07, 0.06), noseCF * CFrame.new(0, i * 0.22, -0.28), CHROME, Enum.Material.Metal)
+	end
+	mk("GrilleFrameTop", Vector3.new(3.7, 0.08, 0.1), noseCF * CFrame.new(0, 0.44, -0.25), CHROME, Enum.Material.Metal)
+	mk("GrilleFrameBottom", Vector3.new(3.7, 0.08, 0.1), noseCF * CFrame.new(0, -0.44, -0.25), CHROME, Enum.Material.Metal)
+	box("BumperFront", 0, -0.75, -9.45, 8.0, 1.3, 0.6, BODY, nil, PAINT)
+	box("Intake", 0, -0.85, -9.78, 5.0, 0.6, 0.06, DARK)
+
+	-- Капот, багажник, задняя панель
+	box("Hood", 0, 1.3, -6.3, 7.7, 0.3, 5.4, BODY, nil, PAINT, -4)
+	box("Trunk", 0, 1.3, 7.0, 7.7, 0.3, 4.6, BODY, nil, PAINT)
+	box("RearPanel", 0, -0.025, 9.15, 8.0, 2.35, 0.3, BODY, nil, PAINT)
+	box("BumperRear", 0, -0.85, 9.5, 8.0, 1.1, 0.6, BODY, nil, PAINT)
+
+	-- Номерные знаки
+	addPlate(box("PlateFront", 0, -0.35, -9.82, 2.4, 0.7, 0.08, PLATE), Enum.NormalId.Front)
+	addPlate(box("PlateRear", 0, 0.0, 9.38, 2.4, 0.7, 0.08, PLATE), Enum.NormalId.Back)
+
+	-- Спойлер
+	box("Wing", 0, 2.55, 8.6, 7.6, 0.14, 1.5, TRIM, nil, nil, -8)
+
+	-- Салон: стёкла, крыша, кабина
+	box("Windshield", 0, 2.725, -2.65, 7.0, 2.9, 0.1, GLASS, Enum.Material.Glass, GLASSOPT, 36)
+	box("RearWindow", 0, 2.7, 3.7, 6.8, 3.0, 0.1, GLASS, Enum.Material.Glass, GLASSOPT, -37)
+	box("Roof", 0, 4.0, 0.5, 7.0, 0.25, 4.6, BODY, nil, PAINT)
+	box("Headliner", 0, 3.85, 0.5, 6.7, 0.08, 4.4, INTERIOR)
+	box("CabinFloor", 0, -1.05, 0.2, 7.1, 0.12, 8.0, INTERIOR)
+	box("Firewall", 0, 0.1, -3.75, 7.4, 2.4, 0.15, INTERIOR)
+	box("Dash", 0, 0.95, -3.0, 7.0, 0.9, 1.4, INTERIOR)
+	box("Binnacle", -1.9, 1.55, -2.7, 2.2, 0.5, 0.9, DARK)
+	box("Screen", 0.2, 1.7, -2.55, 1.6, 0.9, 0.12, DARK)
+	box("Console", 0, -0.45, -0.3, 1.0, 1.3, 4.2, INTERIOR)
+	box("Shifter", 0, 0.45, -0.9, 0.25, 0.8, 0.25, TRIM)
+
+	-- Сиденья (поверхность сиденья водителя на y = 0)
+	for _, sx in ipairs({ -1.9, 1.9 }) do
+		box("SeatBase", sx, -0.85, 0.2, 1.4, 0.5, 1.6, TRIM)
+		box("SeatCushion", sx, -0.28, 0.2, 2.2, 0.56, 2.4, SEATCOL)
+		box("SeatBack", sx, 1.25, 1.35, 2.2, 2.7, 0.5, SEATCOL, nil, nil, 10)
+		box("Headrest", sx, 2.85, 1.65, 1.0, 0.6, 0.4, SEATCOL, nil, nil, 10)
+	end
+	box("RearSeat", 0, -0.3, 3.0, 6.2, 0.6, 2.0, SEATCOL)
+	box("RearSeatBack", 0, 1.0, 3.95, 6.2, 2.3, 0.45, SEATCOL, nil, nil, 12)
+
+	-- Руль: ступица вращается через Weld.C0
+	local steerBase = CFrame.new(-1.9, 1.5, -1.7) * CFrame.Angles(math.rad(-24), 0, 0)
+	local steerHub = mk("SteerHub", Vector3.new(0.5, 0.5, 0.25), steerBase, TRIM)
+	car.steerWeld = steerHub:FindFirstChildOfClass("Weld")
+	car.steerBase = steerBase
+	for i = 0, 15 do
+		local a = i * math.pi / 8
+		local cf = CFrame.new(0.85 * math.cos(a), 0.85 * math.sin(a), 0) * CFrame.Angles(0, 0, a + math.pi / 2)
+		mk("SteerRing", Vector3.new(0.37, 0.22, 0.22), cf, TRIM, nil, nil, steerHub)
+	end
+	for _, a in ipairs({ math.pi, 0, -math.pi / 2 }) do
+		local cf = CFrame.new(0.425 * math.cos(a), 0.425 * math.sin(a), 0) * CFrame.Angles(0, 0, a - math.pi / 2)
+		mk("SteerSpoke", Vector3.new(0.14, 0.85, 0.14), cf, TRIM, nil, nil, steerHub)
+	end
+	box("SteerColumn", -1.9, 1.05, -2.4, 0.35, 0.35, 1.2, TRIM, nil, nil, -24)
+
+	-- Боковые детали (зеркально для обеих сторон)
+	for _, s in ipairs({ -1, 1 }) do
+		local sx = s * 3.85
+
+		local function seg(name, z0, z1)
+			box(name, sx, -0.125, (z0 + z1) / 2, 0.3, 2.55, z1 - z0, BODY, nil, PAINT)
+		end
+		-- борта с вырезами под колёса
+		seg("SideFront", -9.4, aF - ARCH_R)
+		seg("SideMid", aF + ARCH_R, aR - ARCH_R)
+		seg("SideRear", aR + ARCH_R, 9.4)
+		box("Skirt", s * 4.05, -1.2, (aF + aR) / 2, 0.3, 0.4, (aR - aF) - 2 * ARCH_R, TRIM)
+		box("DoorCard", s * 3.62, 0.175, 0, 0.14, 2.55, 7.2, INTERIOR)
+		box("Belt", s * 3.7, 1.3, 0.2, 0.6, 0.3, 8.0, BODY, nil, PAINT)
+
+		-- арки: тёмная ниша и расширитель по дуге
+		for _, ax in ipairs({ aF, aR }) do
+			box("ArchLiner", s * 2.55, -0.125, ax, 0.2, 2.55, ARCH_R * 2, DARK)
+			for i = 0, 8 do
+				local a = math.rad(10 + i * 20)
+				local cf = CFrame.new(s * 4.05, wheelCY + ARCH_R * math.sin(a), ax + ARCH_R * math.cos(a)) * CFrame.Angles(-a, 0, 0)
+				mk("ArchFlare", Vector3.new(0.4, 0.72, 0.3), cf, TRIM)
+			end
+		end
+
+		-- стойки
+		box("PillarA", s * 3.55, 2.725, -2.65, 0.4, 2.95, 0.22, BODY, nil, PAINT, 36)
+		box("PillarB", s * 3.82, 2.6, 0.55, 0.25, 2.5, 0.45, TRIM)
+		box("PillarC", s * 3.5, 2.7, 3.7, 0.5, 3.05, 0.3, BODY, nil, PAINT, -37)
+		box("RoofRail", s * 3.6, 3.95, 0.5, 0.4, 0.25, 4.8, BODY, nil, PAINT)
+
+		-- боковые стёкла полосами (форма следует наклону стоек)
+		for i = 0, 4 do
+			local y = 1.5 + 0.47 * (i + 0.5)
+			local zA = -3.5 + (y - 1.55) * (1.7 / 2.35) + 0.2
+			local zC = 4.6 - (y - 1.5) * 0.75 - 0.2
+			if 0.325 - zA > 0.2 then
+				mk("GlassFront", Vector3.new(0.08, 0.47, 0.325 - zA), CFrame.new(s * 3.78, y, (zA + 0.325) / 2), GLASS, Enum.Material.Glass, GLASSOPT)
+			end
+			if zC - 0.775 > 0.2 then
+				mk("GlassRear", Vector3.new(0.08, 0.47, zC - 0.775), CFrame.new(s * 3.78, y, (0.775 + zC) / 2), GLASS, Enum.Material.Glass, GLASSOPT)
+			end
+		end
+
+		-- двери, ручки, зеркала
+		for _, z in ipairs({ -3.4, 0.55, 3.45 }) do
+			box("DoorLine", s * 4.02, 0.1, z, 0.04, 2.3, 0.05, DARK)
+		end
+		for _, z in ipairs({ 0.0, 2.9 }) do
+			box("DoorHandle", s * 4.07, 0.85, z, 0.1, 0.16, 0.8, CHROME)
+		end
+		box("MirrorArm", s * 4.2, 1.7, -2.9, 0.4, 0.12, 0.25, TRIM)
+		box("Mirror", s * 4.55, 1.85, -2.85, 0.35, 0.55, 0.8, BODY, nil, PAINT)
+		box("MirrorGlass", s * 4.55, 1.85, -2.43, 0.3, 0.45, 0.04, CHROME, nil, { reflectance = 0.5 })
+
+		-- спойлер: стойки и боковые пластины
+		box("WingPost", s * 2.4, 1.95, 8.55, 0.25, 1.1, 0.5, TRIM)
+		box("WingEnd", s * 3.85, 2.55, 8.6, 0.12, 0.8, 1.7, BODY, nil, PAINT)
+
+		-- фары (ближний свет) и прожекторы (дальний)
+		mk("HeadHousing", Vector3.new(1.7, 0.7, 0.2), noseCF * CFrame.new(s * 2.85, 0.1, -0.2), DARK)
+		local lens = mk("HeadLens", Vector3.new(1.45, 0.45, 0.12), noseCF * CFrame.new(s * 2.85, 0.1, -0.31), HEAD_OFF)
+		table.insert(car.headLenses, lens)
+		local lamp = mk("HeadLamp", Vector3.new(0.3, 0.3, 0.3), CFrame.new(s * 2.85, 0.75, -9.15), DARK, nil, INVIS)
+		table.insert(car.headSpots, addSpot(lamp, 60, 80, 2.5))
+
+		local driveLens = mk("DriveLampLens", Vector3.new(0.8, 0.45, 0.1), CFrame.new(s * 3.2, -0.6, -9.8), HEAD_OFF)
+		table.insert(car.driveLenses, driveLens)
+		local driveLamp = mk("DriveLamp", Vector3.new(0.3, 0.3, 0.3), CFrame.new(s * 3.2, -0.6, -9.95), DARK, nil, INVIS)
+		table.insert(car.highSpots, addSpot(driveLamp, 60, 28, 5))
+
+		-- задние фонари, свет заднего хода
+		local tail = mk("TailLens", Vector3.new(2.4, 0.6, 0.12), CFrame.new(s * 2.6, 0.55, 9.33), TAIL_OFF)
+		table.insert(car.tailLenses, tail)
+		table.insert(car.tailLights, new("PointLight", {
+			Color = Color3.fromRGB(255, 30, 30),
+			Range = 8,
+			Brightness = 1,
+			Enabled = false,
+		}, tail))
+		local rev = mk("ReverseLens", Vector3.new(0.9, 0.35, 0.1), CFrame.new(s * 0.8, 0.55, 9.33), REV_OFF)
+		table.insert(car.reverseLenses, rev)
+
+		-- выхлопные трубы с дымом
+		local exCF = CFrame.new(s * 2.3, -1.0, 9.9) * CFrame.Angles(0, math.rad(90), 0)
+		mk("ExhaustTip", Vector3.new(0.9, 0.7, 0.7), exCF, CHROME, Enum.Material.Metal, { cylinder = true, reflectance = 0.3 })
+		mk("ExhaustHole", Vector3.new(0.96, 0.5, 0.5), exCF, DARK, nil, { cylinder = true })
+		local exEmit = mk("ExhaustEmit", Vector3.new(0.2, 0.2, 0.2), CFrame.new(s * 2.3, -1.0, 10.45), DARK, nil, INVIS)
+		table.insert(car.exhaustSmoke, addSmoke(exEmit, Enum.NormalId.Back, false))
+	end
+
+	-- Колёса: ступица на Weld (подвеска и руль меняют C0), шина, диск, спицы
+	local R, W = CFG.WHEEL_RADIUS, CFG.WHEEL_WIDTH
+	local defs = {
+		{ name = "FL", x = -CFG.TRACK_HALF, z = aF, front = true, side = -1 },
+		{ name = "FR", x = CFG.TRACK_HALF, z = aF, front = true, side = 1 },
+		{ name = "RL", x = -CFG.TRACK_HALF, z = aR, front = false, side = -1 },
+		{ name = "RR", x = CFG.TRACK_HALF, z = aR, front = false, side = 1 },
+	}
+	
+	for _, d in ipairs(defs) do
+		local hub = mk("Hub" .. d.name, Vector3.new(0.4, 0.4, 0.4), CFrame.new(d.x, wheelCY, d.z), TRIM, nil, INVIS)
+		local o = d.side -- направление "наружу"
+		mk("Tire", Vector3.new(W, 2 * R, 2 * R), CFrame.new(0, 0, 0), TIRE, Enum.Material.SmoothPlastic, { cylinder = true, shadow = false }, hub)
+		mk("RimLip", Vector3.new(0.12, 1.48 * R, 1.48 * R), CFrame.new(o * 0.62, 0, 0), CHROME, Enum.Material.Metal, { cylinder = true, reflectance = 0.25, shadow = false }, hub)
+		mk("RimDish", Vector3.new(0.1, 1.28 * R, 1.28 * R), CFrame.new(o * 0.66, 0, 0), DARK, nil, { cylinder = true, shadow = false }, hub)
+		for k = 0, 4 do
+			local a = k * math.pi * 2 / 5
+			local cf = CFrame.new(o * 0.7, 0.425 * math.cos(a), 0.425 * math.sin(a)) * CFrame.Angles(a, 0, 0)
+			mk("Spoke", Vector3.new(0.1, 0.85, 0.2), cf, CHROME, Enum.Material.Metal, { reflectance = 0.25, shadow = false }, hub)
+		end
+		mk("Cap", Vector3.new(0.1, 0.43, 0.43), CFrame.new(o * 0.74, 0, 0), CHROME, Enum.Material.Metal, { cylinder = true, shadow = false }, hub)
+
+		local wheel = {
+			name = d.name,
+			x = d.x,
+			z = d.z,
+			front = d.front,
+			driven = isDriven(d.front),
+			hubWeld = hub:FindFirstChildOfClass("Weld"),
+			w = 0,
+			slip = 0,
+			vx = 0,
+			spin = 0,
+			visL = restL,
+			visTarget = restL,
+			N = 0,
+			contact = false,
+		}
+		if not d.front then
+			local anchor = mk("SmokeAnchor" .. d.name, Vector3.new(0.2, 0.2, 0.2), CFrame.new(d.x, wheelCY - R + 0.3, d.z), DARK, nil, INVIS)
+			wheel.smoke = addSmoke(anchor, Enum.NormalId.Top, true)
+		end
+		table.insert(car.wheels, wheel)
+	end
+
+	-- Коллайдер кабины (чтобы крыша не проваливалась при перевороте)
+	local cabin = mk("CabinCollider", Vector3.new(7.0, 2.5, 4.9), CFrame.new(0, 2.7, 0.55), DARK, nil, INVIS)
+	cabin.CanCollide = true
+	cabin.CanQuery = true
+	car.cabin = cabin
+
+	model.Parent = Workspace
+	return car
+end
+
+---------------------------------------------------------------------------
+-- HUD И КНОПКИ НА ЭКРАНЕ
+---------------------------------------------------------------------------
+-- Размещение под размер экрана: кнопки сверху по центру, панель приборов масштабируется.
+local function layoutHud(H)
+	if not H then
+		return
+	end
+	local vp = H.gui.AbsoluteSize
+	if vp.X < 50 or vp.Y < 50 then
+		return
+	end
+
+	H.panelScale.Scale = math.clamp(math.min(vp.X / 820, vp.Y / 450), 0.6, 1)
+
+	local btns = H.touchButtons
+	if not btns then
+		return
+	end
+	local n = #btns
+	local margin, gap = 8, 6
+	local perRow = (vp.X < 560) and 3 or n
+	local maxW = (perRow == n) and (vp.X * 0.62) or (vp.X - 2 * margin)
+	local bw = math.clamp((maxW - (perRow - 1) * gap) / perRow, 50, 100)
+	local bh = math.clamp(vp.Y * 0.115, 34, 46)
+	for i, b in ipairs(btns) do
+		local row = math.floor((i - 1) / perRow)
+		local col = (i - 1) % perRow
+		local inRow = math.min(perRow, n - row * perRow)
+		local total = inRow * bw + (inRow - 1) * gap
+		local x0 = (vp.X - total) / 2
+		b.Position = UDim2.fromOffset(x0 + col * (bw + gap), margin + row * (bh + gap))
+		b.Size = UDim2.fromOffset(bw, bh)
+	end
+end
+
+local function buildHud()
+	local H = {}
+	local gui = new("ScreenGui", {
+		Name = "CarHUD",
+		ResetOnSpawn = false,
+		IgnoreGuiInset = true,
+		DisplayOrder = 50,
+	}, player:WaitForChild("PlayerGui"))
+	H.gui = gui
+
+	local panel = new("Frame", {
+		Name = "Panel",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -10),
+		Size = UDim2.fromOffset(330, 122),
+		BackgroundColor3 = Color3.fromRGB(12, 12, 16),
+		BackgroundTransparency = 0.2,
+		BorderSizePixel = 0,
+		Visible = false,
+	}, gui)
+	new("UICorner", { CornerRadius = UDim.new(0, 16) }, panel)
+	new("UIStroke", { Color = Color3.new(1, 1, 1), Transparency = 0.82, Thickness = 1.5 }, panel)
+	H.panelScale = new("UIScale", { Scale = 1 }, panel)
+	H.panel = panel
+
+	H.speed = new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(14, 4),
+		Size = UDim2.fromOffset(150, 58),
+		Font = Enum.Font.GothamBold,
+		TextSize = 54,
+		TextColor3 = Color3.new(1, 1, 1),
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "0",
+	}, panel)
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(16, 60),
+		Size = UDim2.fromOffset(80, 18),
+		Font = Enum.Font.SourceSansBold,
+		TextSize = 18,
+		TextColor3 = Color3.fromRGB(170, 175, 185),
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "км/ч",
+	}, panel)
+	H.gear = new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(165, 4),
+		Size = UDim2.fromOffset(80, 58),
+		Font = Enum.Font.GothamBold,
+		TextSize = 46,
+		TextColor3 = Color3.fromRGB(255, 190, 60),
+		Text = "1",
+	}, panel)
+	new("TextLabel", {
+		BackgroundTransparency = 1,
+		Position = UDim2.fromOffset(165, 60),
+		Size = UDim2.fromOffset(80, 18),
+		Font = Enum.Font.SourceSansBold,
+		TextSize = 16,
+		TextColor3 = Color3.fromRGB(170, 175, 185),
+		Text = "передача",
+	}, panel)
+
+	local function pedalBar(x, color)
+		local bg = new("Frame", {
+			Position = UDim2.fromOffset(x, 10),
+			Size = UDim2.fromOffset(14, 66),
+			BackgroundColor3 = Color3.fromRGB(40, 40, 48),
+			BorderSizePixel = 0,
+		}, panel)
+		new("UICorner", { CornerRadius = UDim.new(0, 5) }, bg)
+		local fill = new("Frame", {
+			AnchorPoint = Vector2.new(0, 1),
+			Position = UDim2.fromScale(0, 1),
+			Size = UDim2.fromScale(1, 0),
+			BackgroundColor3 = color,
+			BorderSizePixel = 0,
+		}, bg)
+		new("UICorner", { CornerRadius = UDim.new(0, 5) }, fill)
+		return fill
+	end
+	H.gasFill = pedalBar(262, Color3.fromRGB(80, 220, 120))
+	H.brakeFill = pedalBar(290, Color3.fromRGB(235, 70, 70))
+
+	local rpmBg = new("Frame", {
+		Position = UDim2.fromOffset(14, 86),
+		Size = UDim2.fromOffset(302, 8),
+		BackgroundColor3 = Color3.fromRGB(40, 40, 48),
+		BorderSizePixel = 0,
+	}, panel)
+	new("UICorner", { CornerRadius = UDim.new(0, 4) }, rpmBg)
+	H.rpmFill = new("Frame", {
+		Size = UDim2.fromScale(0, 1),
+		BackgroundColor3 = Color3.fromRGB(80, 220, 120),
+		BorderSizePixel = 0,
+	}, rpmBg)
+	new("UICorner", { CornerRadius = UDim.new(0, 4) }, H.rpmFill)
+
+	H.ind = {}
+	local indDefs = { { "tcs", "TCS" }, { "abs", "ABS" }, { "hand", "РУЧНИК" }, { "lights", "ФАРЫ" } }
+	for i, d in ipairs(indDefs) do
+		H.ind[d[1]] = new("TextLabel", {
+			BackgroundTransparency = 1,
+			Position = UDim2.fromOffset(10 + (i - 1) * 78, 100),
+			Size = UDim2.fromOffset(76, 18),
+			Font = Enum.Font.SourceSansBold,
+			TextSize = 15,
+			TextColor3 = Color3.fromRGB(78, 80, 90),
+			Text = d[2],
+		}, panel)
+	end
+
+	H.prompt = new("TextButton", {
+		Name = "Prompt",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -80),
+		Size = UDim2.fromOffset(240, 44),
+		BackgroundColor3 = Color3.fromRGB(18, 18, 24),
+		BackgroundTransparency = 0.15,
+		Font = Enum.Font.SourceSansBold,
+		TextSize = 22,
+		TextColor3 = Color3.new(1, 1, 1),
+		Text = UserInputService.KeyboardEnabled and "Сесть в машину [E]" or "Сесть в машину",
+		Visible = false,
+	}, gui)
+	new("UICorner", { CornerRadius = UDim.new(0, 12) }, H.prompt)
+	H.prompt.Activated:Connect(function()
+		enterCar()
+	end)
+
+	-- Кнопки для телефона: один компактный ряд сверху по центру
+	if UserInputService.TouchEnabled then
+		H.touchButtons = {}
+		local function touchButton(text)
+			local b = new("TextButton", {
+				Size = UDim2.fromOffset(90, 40),
+				BackgroundColor3 = Color3.fromRGB(18, 18, 24),
+				BackgroundTransparency = 0.25,
+				Font = Enum.Font.SourceSansBold,
+				TextColor3 = Color3.new(1, 1, 1),
+				TextScaled = true,
+				Text = text,
+				Visible = false,
+			}, gui)
+			new("UICorner", { CornerRadius = UDim.new(0, 10) }, b)
+			new("UITextSizeConstraint", { MaxTextSize = 20, MinTextSize = 9 }, b)
+			new("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4) }, b)
+			table.insert(H.touchButtons, b)
+			return b
+		end
+		local btnExit = touchButton("ВЫЙТИ")
+		local btnLights = touchButton("ФАРЫ")
+		local btnHand = touchButton("РУЧНИК")
+		local btnFlip = touchButton("НА КОЛЁСА")
+		H.btnView = touchButton("1 ЛИЦО")
+
+		btnExit.Activated:Connect(function()
+			exitCar()
+		end)
+		btnLights.Activated:Connect(function()
+			cycleLights()
+		end)
+		btnFlip.Activated:Connect(function()
+			flipCar()
+		end)
+		H.btnView.Activated:Connect(function()
+			toggleCamera()
+		end)
+
+		-- ручник: пока держишь палец
+		btnHand.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				S.touchHand = true
+				local conn
+				conn = input.Changed:Connect(function()
+					if input.UserInputState == Enum.UserInputState.End or input.UserInputState == Enum.UserInputState.Cancel then
+						S.touchHand = false
+						if conn then
+							conn:Disconnect()
+						end
+					end
+				end)
+			end
+		end)
+		btnHand.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+				S.touchHand = false
+			end
+		end)
+	end
+
+	gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		layoutHud(H)
+	end)
+	layoutHud(H)
+	return H
+end
+
+local OFF_COLOR = Color3.fromRGB(78, 80, 90)
+
+local function updateHud()
+	local H = HUD
+	if not H or not CAR or not CAR.chassis.Parent then
+		return
+	end
+	local driving = S.driving
+
+	H.panel.Visible = driving
+	if H.touchButtons then
+		for _, b in ipairs(H.touchButtons) do
+			b.Visible = driving
+		end
+	end
+
+	local near = false
+	if not driving then
+		local ch = player.Character
+		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+		if hrp and (hrp.Position - CAR.chassis.Position).Magnitude <= CFG.ENTER_DISTANCE then
+			near = true
+		end
+	end
+	H.prompt.Visible = near
+	if not driving then
+		return
+	end
+
+	if H.btnView then
+		local viewText = S.camMode == 1 and "1 ЛИЦО" or "3 ЛИЦО"
+		if H.btnView.Text ~= viewText then
+			H.btnView.Text = viewText
+		end
+	end
+
+	local kmh = math.floor(S.speedKmh + 0.5)
+	if kmh ~= S.lastKmh then
+		S.lastKmh = kmh
+		H.speed.Text = tostring(kmh)
+	end
+	local gearText = S.reverse and "R" or tostring(S.gear)
+	if gearText ~= H.gear.Text then
+		H.gear.Text = gearText
+		H.gear.TextColor3 = S.reverse and Color3.fromRGB(255, 90, 90) or Color3.fromRGB(255, 190, 60)
+	end
+
+	local frac = math.clamp(S.rpm / CFG.REDLINE_RPM, 0, 1)
+	H.rpmFill.Size = UDim2.fromScale(frac, 1)
+	H.rpmFill.BackgroundColor3 = Color3.fromHSV(0.33 * (1 - frac), 0.85, 1)
+	H.gasFill.Size = UDim2.fromScale(1, S.throttle)
+	H.brakeFill.Size = UDim2.fromScale(1, S.brake)
+
+	local ind = H.ind
+	ind.tcs.Text = S.tcsEnabled and "TCS" or "TCS OFF"
+	ind.tcs.TextColor3 = S.tcsActive and Color3.fromRGB(255, 160, 40) or OFF_COLOR
+	ind.abs.TextColor3 = S.absActive and Color3.fromRGB(255, 220, 60) or OFF_COLOR
+	ind.hand.TextColor3 = S.handbrakeOn and Color3.fromRGB(255, 70, 70) or OFF_COLOR
+	ind.lights.Text = S.lights == 2 and "ДАЛЬНИЙ" or "ФАРЫ"
+	ind.lights.TextColor3 = S.lights > 0 and Color3.fromRGB(90, 190, 255) or OFF_COLOR
+end
+
+---------------------------------------------------------------------------
+-- ВВОД
+---------------------------------------------------------------------------
+local function keyAxis(a, b)
+	return (UserInputService:IsKeyDown(a) or UserInputService:IsKeyDown(b)) and 1 or 0
+end
+
+local function readInput()
+	local fwd = keyAxis(Enum.KeyCode.W, Enum.KeyCode.Up)
+	local back = keyAxis(Enum.KeyCode.S, Enum.KeyCode.Down)
+	local steer = keyAxis(Enum.KeyCode.D, Enum.KeyCode.Right) - keyAxis(Enum.KeyCode.A, Enum.KeyCode.Left)
+	local hand = UserInputService:IsKeyDown(Enum.KeyCode.Space) or S.touchHand
+
+	-- стандартные контроллеры Roblox: стик телефона и геймпада
+	if controls then
+		local ok, mv = pcall(function()
+			return controls:GetMoveVector()
+		end)
+		if ok and mv then
+			fwd = math.max(fwd, math.clamp(-mv.Z, 0, 1))
+			back = math.max(back, math.clamp(mv.Z, 0, 1))
+			steer = math.clamp(steer + mv.X, -1, 1)
+		end
+	end
+
+	if UserInputService.GamepadEnabled then
+		for _, obj in ipairs(UserInputService:GetGamepadState(Enum.UserInputType.Gamepad1)) do
+			if obj.KeyCode == Enum.KeyCode.ButtonR2 then
+				fwd = math.max(fwd, obj.Position.Z)
+			elseif obj.KeyCode == Enum.KeyCode.ButtonL2 then
+				back = math.max(back, obj.Position.Z)
+			end
+		end
+		if UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, Enum.KeyCode.ButtonX) then
+			hand = true
+		end
+	end
+
+	return { fwd = fwd, back = back, steer = steer, hand = hand }
+end
+
+---------------------------------------------------------------------------
+-- СВЕТ
+---------------------------------------------------------------------------
+local function updateLights()
+	local car = CAR
+	if not car then
+		return
+	end
+	local braking = (S.driving and (S.brake > 0.08 or S.handbrakeOn)) and true or false
+	local rev = (S.driving and S.reverse) and true or false
+	if braking == S.lastBraking and rev == S.lastRev and S.lights == S.lastLights then
+		return
+	end
+	S.lastBraking, S.lastRev, S.lastLights = braking, rev, S.lights
+
+	local headOn = S.lights >= 1
+	local high = S.lights == 2
+	for _, p in ipairs(car.headLenses) do
+		setEmissive(p, headOn, HEAD_ON, HEAD_OFF)
+	end
+	for _, p in ipairs(car.driveLenses) do
+		setEmissive(p, high, HEAD_ON, HEAD_OFF)
+	end
+	for _, l in ipairs(car.headSpots) do
+		l.Enabled = headOn
+		l.Angle = high and 55 or 80
+		l.Brightness = high and 3.5 or 2.5
+	end
+	for _, l in ipairs(car.highSpots) do
+		l.Enabled = high
+	end
+	for _, p in ipairs(car.tailLenses) do
+		if braking then
+			setEmissive(p, true, Color3.fromRGB(255, 25, 25), TAIL_OFF)
+		elseif headOn then
+			setEmissive(p, true, Color3.fromRGB(150, 8, 8), TAIL_OFF)
+		else
+			setEmissive(p, false, TAIL_OFF, TAIL_OFF)
+		end
+	end
+	for _, l in ipairs(car.tailLights) do
+		l.Enabled = braking or headOn
+		l.Brightness = braking and 2 or 0.8
+	end
+	for _, p in ipairs(car.reverseLenses) do
+		setEmissive(p, rev, Color3.new(1, 1, 1), REV_OFF)
+	end
+end
+
+---------------------------------------------------------------------------
+-- ФИЗИКА
+---------------------------------------------------------------------------
+local function stepCar(dtRaw)
+	local car = CAR
+	if not car or not car.chassis.Parent then
+		return
+	end
+	local dt = math.clamp(dtRaw, 1 / 240, 1 / 30)
+	local chassis = car.chassis
+	local cf = chassis.CFrame
+	local up, fwd = cf.UpVector, cf.LookVector
+	local vel = chassis.AssemblyLinearVelocity
+	local mass = chassis.AssemblyMass
+	local g = Workspace.Gravity
+	local vf = vel:Dot(fwd)
+	local speed = vel.Magnitude
+	local R = CFG.WHEEL_RADIUS
+	local wheels = car.wheels
+
+	-- Педали газа и тормоза, выбор D / R
+	local inp = S.driving and readInput() or NO_INPUT
+	local hand = inp.hand
+	local gasTarget, brakeTarget
+	if not S.reverse then
+		gasTarget, brakeTarget = inp.fwd, inp.back
+		if inp.back > 0.2 and inp.fwd < 0.1 and vf < 1.5 then
+			S.reverseTimer += dt
+			if S.reverseTimer > 0.25 then
+				S.reverse = true
+				S.reverseTimer = 0
+				S.shiftTimer = CFG.SHIFT_TIME
+			end
+		else
+			S.reverseTimer = 0
+		end
+	else
+		gasTarget, brakeTarget = inp.back, inp.fwd
+		if inp.fwd > 0.2 and inp.back < 0.1 and vf > -1.5 then
+			S.reverseTimer += dt
+			if S.reverseTimer > 0.25 then
+				S.reverse = false
+				S.reverseTimer = 0
+				S.gear = 1
+				S.shiftTimer = CFG.SHIFT_TIME
+			end
+		else
+			S.reverseTimer = 0
+		end
+	end
+	if not S.driving then
+		-- стоянка: ручник и лёгкий тормоз
+		gasTarget, brakeTarget, hand = 0, 0.6, true
+	end
+	S.handbrakeOn = hand
+	S.throttle = approach(S.throttle, gasTarget, dt * 5, dt * 9)
+	S.brake = approach(S.brake, brakeTarget, dt * 9, dt * 12)
+
+	-- Руль: чем быстрее, тем меньше угол
+	local steerFactor = math.clamp(math.abs(vf) / CFG.STEER_FADE_SPEED, 0, 1)
+	local maxSteer = math.rad(CFG.STEER_MAX_LOW + (CFG.STEER_MAX_HIGH - CFG.STEER_MAX_LOW) * steerFactor)
+	local steerTarget = inp.steer * maxSteer
+	local steerRate = (math.abs(steerTarget) > math.abs(S.steer)) and CFG.STEER_RATE_IN or CFG.STEER_RATE_OUT
+	S.steer = approach(S.steer, steerTarget, dt * steerRate, dt * steerRate)
+
+	-- Автоматическая коробка передач
+	local nDriven, wSum = 0, 0
+	for _, wh in ipairs(wheels) do
+		if wh.driven then
+			nDriven += 1
+			wSum += wh.w
+		end
+	end
+	local wDrive = wSum / math.max(nDriven, 1)
+	local gearsN = #CFG.GEARS
+	local function ratioNow()
+		return (S.reverse and CFG.REVERSE_RATIO or CFG.GEARS[S.gear]) * CFG.FINAL_DRIVE
+	end
+	local gearRatio = ratioNow()
+	local rpmWheels = math.abs(wDrive) * gearRatio * 9.5493
+
+	S.shiftTimer = math.max(0, S.shiftTimer - dt)
+	S.shiftCooldown = math.max(0, S.shiftCooldown - dt)
+	if not S.reverse and S.shiftCooldown <= 0 and S.shiftTimer <= 0 then
+		local th = S.throttle
+		local upRpm = CFG.UPSHIFT_RPM[1] + (CFG.UPSHIFT_RPM[2] - CFG.UPSHIFT_RPM[1]) * th
+		local downRpm = CFG.DOWNSHIFT_RPM[1] + (CFG.DOWNSHIFT_RPM[2] - CFG.DOWNSHIFT_RPM[1]) * th
+		if rpmWheels > upRpm and S.gear < gearsN then
+			S.gear += 1
+			S.shiftTimer = CFG.SHIFT_TIME
+			S.shiftCooldown = 0.5
+		elseif rpmWheels < downRpm and S.gear > 1 then
+			S.gear -= 1
+			S.shiftTimer = CFG.SHIFT_TIME * 0.6
+			S.shiftCooldown = 0.3
+		end
+		gearRatio = ratioNow()
+	end
+
+	-- Двигатель: обороты, сцепление, ограничитель
+	local launch = CFG.IDLE_RPM + (CFG.LAUNCH_RPM - CFG.IDLE_RPM) * S.throttle
+	local rpm = math.max(rpmWheels, launch)
+	local clutch = math.clamp(rpmWheels / CFG.CLUTCH_FULL_RPM, CFG.CLUTCH_MIN, 1)
+	local limiter = rpm >= CFG.REDLINE_RPM
+	rpm = math.min(rpm, CFG.REDLINE_RPM + 200)
+	S.rpm += (rpm - S.rpm) * math.min(1, dt * 14)
+
+	-- Противобуксовочная система: режет газ, пока колёса пробуксовывают
+	local dirSign = S.reverse and -1 or 1
+	local tcsTarget = 1
+	S.tcsActive = false
+	if S.tcsEnabled and S.driving and not hand and S.throttle > 0.05 then
+		local worst = 0
+		for _, wh in ipairs(wheels) do
+			if wh.driven and wh.contact then
+				local m = math.max(wh.slip * dirSign, 0) / math.max(math.abs(wh.vx), 5)
+				worst = math.max(worst, m)
+			end
+		end
+		if worst > CFG.TCS_THRESHOLD then
+			tcsTarget = math.clamp(1 - (worst - CFG.TCS_THRESHOLD) * CFG.TCS_GAIN, 0.05, 1)
+			S.tcsActive = true
+		end
+	end
+	S.tcsFactor = approach(S.tcsFactor, tcsTarget, dt * 3, dt * 25)
+
+	-- Крутящий момент и торможение двигателем
+	local peakTorque = CFG.ACCEL_FIRST_GEAR * mass * R / (CFG.GEARS[1] * CFG.FINAL_DRIVE * CFG.DRIVETRAIN_EFF)
+	local driveTorque, engBrake = 0, 0
+	if S.shiftTimer <= 0 then
+		if not limiter and not (S.reverse and -vf > CFG.REVERSE_MAX_SPEED) then
+			driveTorque = peakTorque * torqueFactor(rpm) * S.throttle * S.tcsFactor * clutch * dirSign
+		end
+		local roll = math.clamp(wDrive * R / 3, -1, 1)
+		local rpmK = 0.25 + 0.75 * math.min(rpm / CFG.REDLINE_RPM, 1)
+		engBrake = peakTorque * CFG.ENGINE_BRAKE * (1 - S.throttle) * rpmK * roll * math.max(clutch, 0.6)
+	end
+	local wheelTorque = (driveTorque - engBrake) * gearRatio * CFG.DRIVETRAIN_EFF
+	local driveForceEach = wheelTorque / math.max(nDriven, 1) / R
+
+	-- Подвеска и шины на каждом колесе
+	local Mw = mass / 4
+	local omega2 = g / CFG.SUSP_STATIC_COMPRESSION
+	local K = Mw * omega2
+	local C = Mw * 2 * CFG.SUSP_DAMPING_RATIO * math.sqrt(omega2)
+	local Lmin = CFG.SUSP_REST - CFG.SUSP_BUMP
+	local Lmax = CFG.SUSP_REST + CFG.SUSP_DROOP
+	local totalBrake = CFG.BRAKE_FORCE * mass * g
+	local anyContact = false
+
+	for _, wh in ipairs(wheels) do
+		local mountWorld = cf:PointToWorldSpace(Vector3.new(wh.x, CFG.MOUNT_Y, wh.z))
+		local res = Workspace:Raycast(mountWorld, -up * (Lmax + R), rayParams)
+		local steerAngle = wh.front and S.steer or 0
+		local slipping = false
+
+		if res then
+			anyContact = true
+			wh.contact = true
+
+			-- пружина + демпфер (нормальная сила)
+			local L = math.clamp(res.Distance - R, 0.05, Lmax)
+			local vMount = chassis:GetVelocityAtPosition(mountWorld)
+			local N = K * (CFG.SUSP_REST - L) - C * vMount:Dot(up)
+			if L < Lmin then
+				N += K * 6 * (Lmin - L) -- ограничитель хода сжатия
+			end
+			N = math.clamp(N, 0, Mw * g * 6)
+			wh.N = N
+			wh.visTarget = L
+
+			-- оси колеса в плоскости земли (с учётом поворота руля)
+			local wc = mountWorld - up * L
+			local n = res.Normal
+			local wf = CFrame.fromAxisAngle(up, -steerAngle):VectorToWorldSpace(fwd)
+			wf = wf - n * wf:Dot(n)
+			if wf.Magnitude < 1e-3 then
+				wf = fwd
+			end
+			wf = wf.Unit
+			local wr = wf:Cross(n).Unit
+
+			local vp = chassis:GetVelocityAtPosition(wc)
+			local vx, vy = vp:Dot(wf), vp:Dot(wr)
+			wh.vx = vx
+
+			local mu = CFG.TIRE_GRIP * (SURFACE_GRIP[res.Material] or 1) * (wh.front and 1 or CFG.REAR_GRIP_BIAS)
+			local Fmax = mu * N
+
+			-- продольная команда: тяга и тормоза (ABS не даёт заблокировать колесо)
+			local driveF = wh.driven and driveForceEach or 0
+			local brakeShare = wh.front and CFG.BRAKE_FRONT_BIAS or (1 - CFG.BRAKE_FRONT_BIAS)
+			local brakeMax = totalBrake * brakeShare * 0.5 * S.brake
+			local rearHand = hand and not wh.front
+			if rearHand then
+				brakeMax += CFG.HANDBRAKE_FORCE * mass * g * 0.5
+			elseif CFG.ABS and brakeMax > Fmax * 0.88 then
+				brakeMax = Fmax * 0.88
+				S.absTimer = 0.2
+			end
+			brakeMax += CFG.ROLLING_RESISTANCE * N -- сопротивление качению
+			local brakeMag = math.min(brakeMax, Mw * 0.9 * math.abs(vx) / dt)
+			local FxCmd = driveF - math.sign(vx) * brakeMag
+			local FyCmd = -vy * Mw * CFG.LATERAL_GAIN / dt
+
+			-- круг трения с мягким переходом к пределу сцепления
+			local Fx, Fy = FxCmd, FyCmd
+			local mag = math.sqrt(FxCmd * FxCmd + FyCmd * FyCmd)
+			local knee = Fmax * 0.65
+			if mag > knee and mag > 1e-4 then
+				local range = math.max(Fmax - knee, 1e-4)
+				local sc = (knee + range * math.tanh((mag - knee) / range)) / mag
+				Fx *= sc
+				Fy *= sc
+			end
+
+			-- пробуксовка: часть команды, которую шина не передала
+			local slipTarget = (FxCmd - Fx) / math.max(Mw, 1e-3) * CFG.SLIP_GAIN
+			wh.slip += (slipTarget - wh.slip) * math.min(1, dt * 12)
+			local surface = vx + wh.slip
+			if rearHand then
+				surface = 0
+			end
+			wh.w = surface / R
+
+			chassis:ApplyImpulseAtPosition((wf * Fx + wr * Fy + up * N) * dt, wc)
+			slipping = math.abs(wh.slip) > 4 or math.abs(vy) > 9 or (rearHand and speed > 15)
+		else
+			-- колесо в воздухе
+			wh.contact = false
+			wh.N = 0
+			wh.visTarget = Lmax
+			wh.vx = 0
+			local driveF = wh.driven and driveForceEach or 0
+			wh.w += driveF / (Mw * 0.12 * R) * dt
+			if S.brake > 0.2 or hand then
+				wh.w *= 1 - math.min(1, dt * 6)
+			end
+			wh.w *= 1 - dt * 0.2
+			local wMax = (CFG.REDLINE_RPM / 9.5493) / math.max(gearRatio, 0.1) * 1.1
+			wh.w = math.clamp(wh.w, -wMax, wMax)
+		end
+
+		-- визуал колеса: ход подвески, руль, вращение
+		wh.visL += (wh.visTarget - wh.visL) * math.min(1, dt * 30)
+		wh.spin = (wh.spin + wh.w * dt) % (math.pi * 2)
+		wh.hubWeld.C0 = CFrame.new(wh.x, CFG.MOUNT_Y - wh.visL, wh.z)
+			* CFrame.Angles(0, -steerAngle, 0)
+			* CFrame.Angles(-wh.spin, 0, 0)
+		if wh.smoke then
+			wh.smoke.Rate = slipping and 45 or 0
+		end
+	end
+
+	-- Сопротивление воздуха и прижимная сила
+	local hv = Vector3.new(vel.X, 0, vel.Z)
+	local hs = hv.Magnitude
+	if hs > 0.5 then
+		chassis:ApplyImpulse(-hv * (hs * CFG.DRAG * mass * dt))
+	end
+	if anyContact then
+		chassis:ApplyImpulse(-up * (CFG.DOWNFORCE * mass * hs * hs * dt))
+	end
+
+	S.absTimer = math.max(0, S.absTimer - dt)
+	S.absActive = S.absTimer > 0
+	S.speedKmh = speed * 0.28 * 3.6
+
+	car.steerWeld.C0 = car.steerBase * CFrame.Angles(0, 0, -S.steer * 5.6)
+	for _, e in ipairs(car.exhaustSmoke) do
+		e.Rate = S.driving and (5 + 40 * S.throttle) or 0
+	end
+	updateLights()
+end
+
+---------------------------------------------------------------------------
+-- РУКИ НА РУЛЕ
+-- Двухзвенная обратная кинематика по Motor6D: руки держат обод руля
+-- и поворачиваются вместе с ним.
+---------------------------------------------------------------------------
+local function findMotor(ch, name)
+	for _, d in ipairs(ch:GetDescendants()) do
+		if d:IsA("Motor6D") and d.Name == name then
+			return d
+		end
+	end
+	return nil
+end
+
+local function collectArms(ch, hum)
+	local arms = {}
+	if hum.RigType == Enum.HumanoidRigType.R15 then
+		for _, side in ipairs({ "Left", "Right" }) do
+			local shoulder = findMotor(ch, side .. "Shoulder")
+			local elbow = findMotor(ch, side .. "Elbow")
+			local wrist = findMotor(ch, side .. "Wrist")
+			if shoulder and elbow and wrist and shoulder.Part0 then
+				table.insert(arms, {
+					side = side,
+					shoulder = shoulder,
+					elbow = elbow,
+					wrist = wrist,
+					torso = shoulder.Part0,
+					pole = Vector3.new(side == "Left" and -0.45 or 0.45, -1, 0.5),
+					v1 = elbow.C0.Position - shoulder.C1.Position,
+					v2 = wrist.C0.Position - elbow.C1.Position,
+				})
+			end
+		end
+	else
+		for _, side in ipairs({ "Left", "Right" }) do
+			local shoulder = findMotor(ch, side .. " Shoulder")
+			if shoulder and shoulder.Part0 and shoulder.Part1 then
+				table.insert(arms, {
+					side = side,
+					shoulder = shoulder,
+					torso = shoulder.Part0,
+					v1 = Vector3.new(0, -shoulder.Part1.Size.Y / 2, 0) - shoulder.C1.Position,
+				})
+			end
+		end
+	end
+	return arms
+end
+
+-- Поворот, переводящий направление a в направление b
+local function rotBetween(a, b)
+	a, b = a.Unit, b.Unit
+	local d = math.clamp(a:Dot(b), -1, 1)
+	if d > 0.99999 then
+		return CFrame.new()
+	end
+	local axis = a:Cross(b)
+	if axis.Magnitude < 1e-4 then
+		axis = a:Cross(Vector3.xAxis)
+		if axis.Magnitude < 1e-3 then
+			axis = a:Cross(Vector3.yAxis)
+		end
+	end
+	return CFrame.fromAxisAngle(axis.Unit, math.acos(d))
+end
+
+local function rotOnly(cf)
+	return cf - cf.Position
+end
+
+local function updateArms()
+	if not S.driving or not S.arms or #S.arms == 0 or not CAR then
+		return
+	end
+	local car = CAR
+	local chassisCF = car.chassis.CFrame
+	local wheelRot = -S.steer * 5.6 -- на сколько повёрнут руль
+
+	for _, arm in ipairs(S.arms) do
+		-- точка хвата на ободе: левая рука слева (9 часов), правая справа (3 часа)
+		local a = (arm.side == "Left" and math.pi or 0) + wheelRot
+		local target = (car.steerBase * CFrame.new(0.9 * math.cos(a), 0.9 * math.sin(a), 0.2)).Position
+
+		-- всё считаем в системе координат шасси, чтобы не отставать от машины
+		local torsoCF = chassisCF:ToObjectSpace(arm.torso.CFrame)
+		local pj = torsoCF * arm.shoulder.C0
+		local s0 = pj.Position
+		local pjRot = rotOnly(pj)
+		local c1Rot = rotOnly(arm.shoulder.C1)
+		local o0 = pjRot * c1Rot:Inverse()
+
+		if arm.elbow then
+			local L1, L2 = arm.v1.Magnitude, arm.v2.Magnitude
+			local toT = target - s0
+			local dist = math.clamp(toT.Magnitude, math.abs(L1 - L2) + 0.05, L1 + L2 - 0.02)
+			local u = toT.Unit
+			local aLen = (L1 * L1 - L2 * L2 + dist * dist) / (2 * dist)
+			local h = math.sqrt(math.max(L1 * L1 - aLen * aLen, 0))
+			local pPerp = arm.pole - u * arm.pole:Dot(u)
+			pPerp = pPerp.Magnitude > 1e-3 and pPerp.Unit or Vector3.new(0, -1, 0)
+			local elbowPos = s0 + u * aLen + pPerp * h
+			local wristPos = s0 + u * dist
+
+			-- плечо
+			local o1 = rotBetween(o0:VectorToWorldSpace(arm.v1), elbowPos - s0) * o0
+			local rm1 = pjRot:Inverse() * o1 * c1Rot
+			arm.shoulder.Transform = rm1
+
+			-- предплечье
+			local upperCF = pj * rm1 * arm.shoulder.C1:Inverse()
+			local pj2 = upperCF * arm.elbow.C0
+			local pj2Rot = rotOnly(pj2)
+			local c1Rot2 = rotOnly(arm.elbow.C1)
+			local o2n = pj2Rot * c1Rot2:Inverse()
+			local o2 = rotBetween(o2n:VectorToWorldSpace(arm.v2), wristPos - elbowPos) * o2n
+			arm.elbow.Transform = pj2Rot:Inverse() * o2 * c1Rot2
+			arm.wrist.Transform = CFrame.new()
+		else
+			-- R6: одна кость, просто тянем руку к рулю
+			local o1 = rotBetween(o0:VectorToWorldSpace(arm.v1), target - s0) * o0
+			arm.shoulder.Transform = pjRot:Inverse() * o1 * c1Rot
+		end
+	end
+end
+
+---------------------------------------------------------------------------
+-- КАМЕРА: снаружи (крутится пальцем / мышью) и от первого лица
+---------------------------------------------------------------------------
+local function setHeadHidden(hide)
+	local ch = S.character
+	if not ch or not ch.Parent then
+		return
+	end
+	for _, d in ipairs(ch:GetDescendants()) do
+		if d:IsA("BasePart") and (d.Name == "Head" or (d.Parent and d.Parent:IsA("Accoutrement"))) then
+			d.LocalTransparencyModifier = hide and 1 or 0
+		end
+	end
+end
+
+local function applyCameraMode()
+	local cam = Workspace.CurrentCamera
+	if not cam then
+		return
+	end
+	if S.driving then
+		cam.CameraType = Enum.CameraType.Scriptable
+	else
+		cam.CameraType = Enum.CameraType.Custom
+		cam.FieldOfView = 70
+		if S.humanoid and S.humanoid.Parent then
+			cam.CameraSubject = S.humanoid
+		end
+	end
+	setHeadHidden(S.driving and S.camMode == 2)
+end
+
+local function lookInput(dx, dy, sens)
+	S.lookYaw = wrapAngle(S.lookYaw - dx * sens)
+	S.lookPitch = math.clamp(S.lookPitch - dy * sens, -1.2, 1.0)
+	S.lookTime = os.clock()
+end
+
+local function updateCamera(dt)
+	if not S.driving or not CAR or not CAR.chassis.Parent then
+		return
+	end
+	local cam = Workspace.CurrentCamera
+	if not cam then
+		return
+	end
+	if cam.CameraType ~= Enum.CameraType.Scriptable then
+		cam.CameraType = Enum.CameraType.Scriptable
+	end
+
+	-- если экран не трогают, камера плавно возвращается за машину
+	if not (dragTouch or dragMouse) and os.clock() - S.lookTime > CFG.CAM_RECENTER_DELAY then
+		local k = 1 - math.exp(-dt * 2.2)
+		S.lookYaw = S.lookYaw * (1 - k)
+		S.lookPitch = S.lookPitch * (1 - k)
+	end
+
+	local chassis = CAR.chassis
+	local cf = chassis.CFrame
+	local speed = chassis.AssemblyLinearVelocity.Magnitude
+
+	if S.camMode == 2 then
+		-- от первого лица: камера в глазах водителя, голова крутится пальцем / мышью
+		local eye = cf * CFrame.new(S.eyeLocal)
+		local yaw = math.clamp(S.lookYaw, -2.2, 2.2)
+		local pitch = math.clamp(S.lookPitch, -1.0, 0.9)
+		cam.CFrame = eye * CFrame.fromOrientation(pitch, yaw, 0)
+		cam.FieldOfView = 78 + math.clamp(speed / 140, 0, 1) * 10
+		return
+	end
+
+	-- снаружи: камера за машиной, можно облететь вокруг
+	local look = cf.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude > 0.05 then
+		flat = flat.Unit
+		camDir = camDir:Lerp(flat, 1 - math.exp(-dt * 4.5))
+		if camDir.Magnitude < 0.05 then
+			camDir = flat
+		end
+		camDir = camDir.Unit
+	end
+	local dir = CFrame.Angles(0, S.lookYaw, 0):VectorToWorldSpace(camDir)
+	local focus = cf.Position + Vector3.new(0, 2.8, 0)
+	local dist = (16 + math.clamp(speed / 80, 0, 1) * 5) * S.zoom
+	local elev = math.clamp(math.rad(18) - S.lookPitch, math.rad(-8), math.rad(78))
+	local pos = focus - dir * (dist * math.cos(elev)) + Vector3.new(0, dist * math.sin(elev), 0)
+
+	camRayParams.FilterDescendantsInstances = { CAR.model, S.character }
+	local hit = Workspace:Raycast(focus, pos - focus, camRayParams)
+	if hit then
+		pos = hit.Position + (focus - pos).Unit * 0.7
+	end
+
+	cam.CFrame = CFrame.lookAt(pos, focus + dir * 5)
+	cam.FieldOfView = 70 + math.clamp(speed / 140, 0, 1) * 14
+end
+
+---------------------------------------------------------------------------
+-- ПОСАДКА, ВЫХОД, СПАВН
+---------------------------------------------------------------------------
+local SIT_ANIM_R15 = "rbxassetid://2506281703"
+local SIT_ANIM_R6 = "rbxassetid://178130996"
+
+local function playSit(hum)
+	local animator = hum:FindFirstChildOfClass("Animator")
+	if not animator then
+		return
+	end
+	local anim = Instance.new("Animation")
+	anim.AnimationId = hum.RigType == Enum.HumanoidRigType.R15 and SIT_ANIM_R15 or SIT_ANIM_R6
+	local ok, track = pcall(function()
+		return animator:LoadAnimation(anim)
+	end)
+	if ok and track then
+		track.Priority = Enum.AnimationPriority.Action
+		track.Looped = true
+		track:Play(0.15)
+		S.sitTrack = track
+	end
+end
+
+local function computeSpawnCF(distance)
+	local ch = player.Character
+	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return CFrame.new(0, 10, 0)
+	end
+	local look = hrp.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	flat = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(0, 0, -1)
+	local pos = hrp.Position + flat * distance
+
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = { ch, CAR and CAR.model }
+	pcall(function()
+		rp.RespectCanCollide = true
+	end)
+	local res = Workspace:Raycast(pos + Vector3.new(0, 60, 0), Vector3.new(0, -300, 0), rp)
+	local y = res and (res.Position.Y + CFG.SPAWN_LIFT) or hrp.Position.Y
+	local p = Vector3.new(pos.X, y, pos.Z)
+	return CFrame.lookAt(p, p + flat)
+end
+
+-- Свободное место рядом с машиной: слева, справа, сзади, на крыше
+local function findExitCFrame(carCF, ch)
+	local offsets = {
+		Vector3.new(-6.6, 1.0, 0.2),
+		Vector3.new(6.6, 1.0, 0.2),
+		Vector3.new(-6.6, 1.0, 6),
+		Vector3.new(6.6, 1.0, 6),
+		Vector3.new(0, 6.5, 0.5),
+	}
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Exclude
+	op.FilterDescendantsInstances = { CAR.model, ch }
+
+	local look = carCF.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	flat = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(0, 0, -1)
+
+	for _, off in ipairs(offsets) do
+		local pos = carCF:PointToWorldSpace(off)
+		local free = true
+		for _, p in ipairs(Workspace:GetPartBoundsInBox(CFrame.new(pos), Vector3.new(2.8, 5, 2.8), op)) do
+			if p.CanCollide then
+				free = false
+				break
+			end
+		end
+		if free then
+			return CFrame.lookAt(pos, pos + flat)
+		end
+	end
+	local pos = carCF:PointToWorldSpace(offsets[#offsets])
+	return CFrame.lookAt(pos, pos + flat)
+end
+
+-- После выхода персонаж не сталкивается с машиной (она ещё едет по инерции)
+local function noCollideWithCar(ch)
+	local list = {}
+	for _, part in ipairs(ch:GetDescendants()) do
+		if part:IsA("BasePart") then
+			for _, carPart in ipairs({ CAR.chassis, CAR.cabin }) do
+				local nc = Instance.new("NoCollisionConstraint")
+				nc.Part0 = part
+				nc.Part1 = carPart
+				nc.Parent = part
+				table.insert(list, nc)
+			end
+		end
+	end
+	task.delay(CFG.EXIT_NOCOLLIDE_TIME, function()
+		for _, nc in ipairs(list) do
+			nc:Destroy()
+		end
+	end)
+end
+
+enterCar = function()
+	if S.driving or not CAR or not CAR.chassis.Parent then
+		return
+	end
+	local ch = player.Character
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	local root = ch and ch:FindFirstChild("HumanoidRootPart")
+	if not hum or not root or hum.Health <= 0 then
+		return
+	end
+	if (root.Position - CAR.chassis.Position).Magnitude > CFG.ENTER_DISTANCE then
+		return
+	end
+
+	local sitH = hum.RigType == Enum.HumanoidRigType.R15 and CFG.SIT_HEIGHT_R15 or CFG.SIT_HEIGHT_R6
+	local sitCF = CFrame.new(CFG.SEAT_X, CFG.SEAT_TOP_Y + sitH, CFG.SEAT_Z)
+
+	S.character, S.humanoid, S.root = ch, hum, root
+	S.savedAutoRotate = hum.AutoRotate
+
+	-- Привязка персонажа к сиденью одним Weld: общий assembly, без столкновений
+	ch:PivotTo(CAR.chassis.CFrame * sitCF)
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	local w = Instance.new("Weld")
+	w.Name = "DriverWeld"
+	w.Part0 = CAR.chassis
+	w.Part1 = root
+	w.C0 = sitCF
+	w.Parent = CAR.chassis
+	S.seatWeld = w
+
+	-- PlatformStand: персонаж не может прыгнуть и вылететь из машины
+	hum.PlatformStand = true
+	hum.AutoRotate = false
+	ContextActionService:BindActionAtPriority("CarNoJump", function()
+		return Enum.ContextActionResult.Sink
+	end, false, 3000, Enum.KeyCode.Space, Enum.KeyCode.ButtonA)
+
+	S.driving = true
+	S.throttle, S.brake, S.steer = 0, 0, 0
+	S.reverse, S.gear = false, 1
+	S.lastKmh = -1
+
+	S.diedConn = hum.Died:Connect(function()
+		exitCar(true)
+	end)
+	playSit(hum)
+
+	-- руки на руль
+	S.arms = collectArms(ch, hum)
+	S.armErr = false
+
+	-- камера: сначала снаружи, смотрит за машину
+	S.eyeLocal = Vector3.new(CFG.SEAT_X, CFG.SEAT_TOP_Y + CFG.EYE_HEIGHT, CFG.SEAT_Z - 0.1)
+	S.lookYaw, S.lookPitch, S.zoom, S.lookTime = 0, 0, 1, os.clock()
+	local look = CAR.chassis.CFrame.LookVector
+	camDir = Vector3.new(look.X, 0, look.Z)
+	camDir = camDir.Magnitude > 0.05 and camDir.Unit or Vector3.new(0, 0, -1)
+	applyCameraMode()
+	layoutHud(HUD)
+end
+
+exitCar = function(forced)
+	if not S.driving then
+		return
+	end
+	S.driving = false
+	S.arms = nil
+	S.touchHand = false
+	ContextActionService:UnbindAction("CarNoJump")
+	if S.diedConn then
+		S.diedConn:Disconnect()
+		S.diedConn = nil
+	end
+	if S.sitTrack then
+		pcall(function()
+			S.sitTrack:Stop(0.1)
+		end)
+		S.sitTrack = nil
+	end
+	if S.seatWeld then
+		S.seatWeld:Destroy()
+		S.seatWeld = nil
+	end
+
+	-- сброс управления камерой
+	dragTouch = nil
+	if dragMouse then
+		dragMouse = false
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	end
+
+	local ch, hum, root = S.character, S.humanoid, S.root
+	if not forced and ch and ch.Parent and hum and hum.Parent and root and root.Parent and CAR and CAR.chassis.Parent then
+		local carVel = CAR.chassis.AssemblyLinearVelocity
+		ch:PivotTo(findExitCFrame(CAR.chassis.CFrame, ch))
+		root.AssemblyLinearVelocity = carVel * CFG.EXIT_VELOCITY_KEEP
+		root.AssemblyAngularVelocity = Vector3.zero
+		noCollideWithCar(ch)
+		hum.PlatformStand = false
+		hum.AutoRotate = S.savedAutoRotate
+		hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+	elseif hum and hum.Parent then
+		hum.PlatformStand = false
+		hum.AutoRotate = S.savedAutoRotate
+	end
+	applyCameraMode()
+end
+
+flipCar = function()
+	if not CAR or not CAR.chassis.Parent then
+		return
+	end
+	local c = CAR.chassis
+	local p = c.Position + Vector3.new(0, 3.5, 0)
+	local look = c.CFrame.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	flat = flat.Magnitude > 0.05 and flat.Unit or Vector3.new(0, 0, -1)
+	c.CFrame = CFrame.lookAt(p, p + flat)
+	c.AssemblyLinearVelocity = Vector3.zero
+	c.AssemblyAngularVelocity = Vector3.zero
+end
+
+callCar = function()
+	if S.driving then
+		return
+	end
+	local cf = computeSpawnCF(CFG.CALL_DISTANCE)
+	if not CAR or not CAR.chassis.Parent then
+		CAR = buildCar(cf)
+		rayParams.FilterDescendantsInstances = { CAR.model, player.Character }
+		S.lastLights = -1
+	else
+		CAR.chassis.CFrame = cf
+		CAR.chassis.AssemblyLinearVelocity = Vector3.zero
+		CAR.chassis.AssemblyAngularVelocity = Vector3.zero
+	end
+end
+
+cycleLights = function()
+	S.lights = (S.lights + 1) % 3
+end
+
+toggleCamera = function()
+	S.camMode = S.camMode == 1 and 2 or 1
+	S.lookYaw, S.lookPitch, S.lookTime = 0, 0, os.clock()
+	applyCameraMode()
+end
+
+---------------------------------------------------------------------------
+-- ЗАПУСК
+---------------------------------------------------------------------------
+local function start()
+	local ch = player.Character or player.CharacterAdded:Wait()
+	ch:WaitForChild("HumanoidRootPart")
+
+	CAR = buildCar(computeSpawnCF(CFG.SPAWN_DISTANCE))
+	rayParams.FilterDescendantsInstances = { CAR.model, player.Character }
+	HUD = buildHud()
+
+	-- стандартные контроллеры (стик на телефоне, геймпад)
+	task.spawn(function()
+		local ok, mod = pcall(function()
+			return require(player:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
+		end)
+		if ok and mod then
+			local ok2, c = pcall(function()
+				return mod:GetControls()
+			end)
+			if ok2 then
+				controls = c
+			end
+		end
+	end)
+
+	-- физика и руки до шага симуляции
+	local okSig, sig = pcall(function()
+		return RunService.PreSimulation
+	end)
+	local stepSignal = (okSig and sig) or RunService.Stepped
+	stepSignal:Connect(function(a, b)
+		stepCar(b or a)
+		if S.driving and S.arms then
+			local ok, err = pcall(updateArms)
+			if not ok and not S.armErr then
+				S.armErr = true
+				warn("CarController: руки не обновились:", err)
+			end
+		end
+	end)
+	RunService.RenderStepped:Connect(updateHud)
+	RunService:BindToRenderStep("LocalCarCamera", Enum.RenderPriority.Camera.Value + 1, updateCamera)
+
+	UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then
+			return
+		end
+		local k = input.KeyCode
+		if k == CFG.KEY_ENTER then
+			enterCar()
+		elseif k == CFG.KEY_EXIT then
+			exitCar()
+		elseif k == Enum.KeyCode.ButtonY then
+			if S.driving then
+				exitCar()
+			else
+				enterCar()
+			end
+		elseif k == CFG.KEY_LIGHTS or k == Enum.KeyCode.ButtonL1 then
+			cycleLights()
+		elseif k == CFG.KEY_FLIP then
+			flipCar()
+		elseif k == CFG.KEY_CALL then
+			callCar()
+		elseif k == CFG.KEY_CAMERA then
+			toggleCamera()
+		elseif k == CFG.KEY_TCS then
+			S.tcsEnabled = not S.tcsEnabled
+		end
+
+		-- камера: палец (правее стика) или правая кнопка мыши
+		if S.driving then
+			if input.UserInputType == Enum.UserInputType.Touch then
+				local cam = Workspace.CurrentCamera
+				local width = cam and cam.ViewportSize.X or 800
+				if input.Position.X > width * 0.4 and not dragTouch then
+					dragTouch = input
+				end
+			elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
+				dragMouse = true
+				UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+			end
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input, processed)
+		if not S.driving then
+			return
+		end
+		if input == dragTouch then
+			lookInput(input.Delta.X, input.Delta.Y, CFG.CAM_TOUCH_SENS)
+		elseif input.UserInputType == Enum.UserInputType.MouseMovement and dragMouse then
+			lookInput(input.Delta.X, input.Delta.Y, CFG.CAM_MOUSE_SENS)
+		elseif input.UserInputType == Enum.UserInputType.MouseWheel and not processed then
+			S.zoom = math.clamp(S.zoom - input.Position.Z * 0.08, CFG.CAM_ZOOM_MIN, CFG.CAM_ZOOM_MAX)
+		end
+	end)
+
+	UserInputService.InputEnded:Connect(function(input)
+		if input == dragTouch then
+			dragTouch = nil
+		end
+		if input.UserInputType == Enum.UserInputType.MouseButton2 and dragMouse then
+			dragMouse = false
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		end
+	end)
+
+	-- щипок двумя пальцами - приблизить / отдалить камеру
+	local pinchBase = 1
+	UserInputService.TouchPinch:Connect(function(_, scale, _, state, processed)
+		if not S.driving or processed then
+			return
+		end
+		if state == Enum.UserInputState.Begin then
+			pinchBase = S.zoom
+			dragTouch = nil
+		else
+			S.zoom = math.clamp(pinchBase / math.max(scale, 0.1), CFG.CAM_ZOOM_MIN, CFG.CAM_ZOOM_MAX)
+		end
+	end)
+
+	player.CharacterAdded:Connect(function(newCh)
+		if S.driving then
+			exitCar(true)
+		end
+		S.character, S.humanoid, S.root = nil, nil, nil
+		if CAR then
+			rayParams.FilterDescendantsInstances = { CAR.model, newCh }
+		end
+	end)
+	player.CharacterRemoving:Connect(function()
+		if S.driving then
+			exitCar(true)
+		end
+	end)
+end
+
+start()
